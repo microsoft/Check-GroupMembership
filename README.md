@@ -19,7 +19,7 @@ Download Check-GroupMembership from [release](https://github.com/Microsoft/Check
     ~~~
 
 4. In the [Windows PowerShell Credential Request] dialog box, enter your Office 365 Admin credentials.
-5. A CSV file will be created in the same directory where the script file is located. (If the issue is not found, the file will be empty.)
+5. A CSV file will be created in the same directory where the script file is located. (If the issues are not found, the file will be empty.)
 
 ## Prerequisites
 
