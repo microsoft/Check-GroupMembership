@@ -1,5 +1,41 @@
+# Check-GroupMembership
 
-# Contributing
+[日本語版 README はこちら](https://github.com/Microsoft/Check-GroupMembership/tree/master/ja-jp)
+
+This script checks if there are groups that have mismatching members in between Azure Active Directory and Exchange Online.
+
+## Download option
+
+Download Check-GroupMembership from [release](https://github.com/Microsoft/Check-GroupMembership/releases) page.
+
+## Usage
+
+1. Download Check-GroupMembership and save on your computer.
+2. Start Windows PowerShell and go to the folder where you saved the script file.
+3. Run the following command. (It is not necessary to connect PowerShell to Azure Active Directory and Exchange Online before running the script.)
+
+    ~~~powershell
+    .\Check-GroupMembership.ps1
+    ~~~
+
+4. In the [Windows PowerShell Credential Request] dialog box, enter your Office 365 Admin credentials.
+5. A CSV file will be created in the same directory where the script file is located. (If the issue is not found, the file will be empty.)
+
+## Prerequisites
+
+This script requires to install the Azure Active Directory V1 module (MSOnline) on your computer. Please refer to [this](https://docs.microsoft.com/en-us/powershell/azure/active-directory/overview?view=azureadps-1.0) page for more information.
+
+## Syntax
+
+```powershell
+.\Check-GroupMembership.ps1 [<CommonParameters>]
+```
+
+## Feedback
+
+If you have any feedback, please post on the [Issues](https://github.com/Microsoft/Check-GroupMembership/issues) list.
+
+## Contributing
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
 Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
