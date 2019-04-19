@@ -67,7 +67,7 @@ function New-ExoSession {
         $TryCount++
 
         $Session = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri https://outlook.office365.com/powershell-liveid/ -Credential $AdminCred -Authentication Basic -AllowRedirection
-        if ($null -eq $Session) {
+        if (-not $Session) {
 
             # Abort if retry count for session creation is over 3 times
             if ($TryCount -ge 3) {
@@ -77,11 +77,12 @@ function New-ExoSession {
             # Sleep 60s in the hope that the issue is transient
             Start-Sleep -Seconds 60
         }
-    } while ($null -eq $Session)
+    } while (-not $Session)
 
-    $SessionInfo = New-Object PSObject
-    $SessionInfo | Add-Member -MemberType NoteProperty -Name "Session"     -Value $Session
-    $SessionInfo | Add-Member -MemberType NoteProperty -Name "ConnectTime" -Value (Get-Date)
+    $SessionInfo = [PSCustomObject]@{
+        Session     = $Session
+        ConnectTime = Get-Date
+    }
     Set-Variable -Name ExoSession -Value $SessionInfo -Scope Script
 }
 
@@ -89,8 +90,11 @@ function New-ExoSession {
 function Remove-ExoSession {
 
     # Remove a session for Exchange Online
-    if ($null -ne $ExoSession -and $null -ne $ExoSession.Session) {
+    if ($ExoSession -and $ExoSession.Session) {
         Remove-PSSession -Session $ExoSession.Session -Confirm:$false
+
+        # Sleep 15s to allow a session to tear down fully
+        Start-Sleep -Seconds 15
     }
 
     Set-Variable -Name ExoSession -Value $null -Scope Script
@@ -103,7 +107,7 @@ function Get-ExoSession {
 
     # Recreate an existing session as needed (for the purpose of Session Stability)
     $CurrentTime = Get-Date
-    if ($null -eq $ExoSession -or $ExoSession.Session.State -ne "Opened" -or ($CurrentTime - $ExoSession.ConnectTime).TotalSeconds -gt 900) {
+    if ((-not $ExoSession) -or ($ExoSession.Session.State -ne "Opened") -or (($CurrentTime - $ExoSession.ConnectTime).TotalSeconds -gt 900)) {
         New-ExoSession
     }    
 
@@ -125,7 +129,7 @@ function Execute-CommandToExo($Command) {
     }
 
     # Sleep a sufficient time (for the purpose of alleviating PowerShell Throttle)
-    Start-Sleep -Milliseconds ($ExecutionTime.TotalMilliseconds)
+    Start-Sleep -Milliseconds $ExecutionTime.TotalMilliseconds
 
     return $ExecutionResult
 }
@@ -133,7 +137,7 @@ function Execute-CommandToExo($Command) {
 # Write output to a file
 function Export-Log($Data, $Path) {
 
-    if ($null -ne $Data) {
+    if ($Data) {
         $Data | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
     }
     else {
@@ -144,12 +148,13 @@ function Export-Log($Data, $Path) {
 # Format string for the member information
 function Format-DisplayString($MemberList) {
 
-    $EntryList = @()
+    $EntryList = New-Object "System.Collections.Generic.List[String]"($MemberList.Count)
     foreach ($Member in $MemberList) {
-        $EntryList += "{ObjectId=$($Member.ObjectId);DisplayName=$($Member.DisplayName);EmailAddress=$($Member.EmailAddress);Description=$($Member.Description)}"
+        $MemberInfo = "{ObjectId=$($Member.ObjectId);DisplayName=$($Member.DisplayName);EmailAddress=$($Member.EmailAddress);Description=$($Member.Description)}"
+        $EntryList.Add($MemberInfo)
     }
 
-    $Text = "[" + [String]::Join(";", $EntryList) + "]"
+    $Text = "[$([String]::Join(";", $EntryList))]"
     return $Text
 }
 
@@ -158,33 +163,39 @@ function Check-InconsistentGroupMember($AadGroup, $ExoGroup) {
 
     # Get the list of group members
     $AadGroupMemberList = @(Get-MsolGroupMember -GroupObjectId $AadGroup.ObjectId -All)
-    $ExoGroupMemberList = @(Execute-CommandToExo -Command ("Get-DistributionGroupMember -Identity $($ExoGroup.ExternalDirectoryObjectId.ToString()) -ResultSize Unlimited | Select-Object -Property ExternalDirectoryObjectId")) | Where-Object { $_.ExternalDirectoryObjectId.ToString() -ne "" }
+    $ExoGroupMemberList = if ($ExoGroup.RecipientTypeDetails.ToString() -eq "GroupMailbox") {
+        @((Execute-CommandToExo -Command "Get-UnifiedGroupLinks -Identity $($ExoGroup.ExternalDirectoryObjectId.ToString()) -LinkType Members -ResultSize Unlimited | Select-Object -Property ExternalDirectoryObjectId") | Where-Object { $_.ExternalDirectoryObjectId.ToString() -ne "" })
+    }
+    else {
+        @((Execute-CommandToExo -Command "Get-DistributionGroupMember -Identity $($ExoGroup.ExternalDirectoryObjectId.ToString()) -ResultSize Unlimited | Select-Object -Property ExternalDirectoryObjectId") | Where-Object { $_.ExternalDirectoryObjectId.ToString() -ne "" })
+    }
 
     # Create a table for comparison
-    $ExoGroupMemberTable = @{ }
+    $ExoGroupMemberTable = New-Object "System.Collections.Generic.Dictionary[String, Object]"($ExoGroupMemberList.Count)
     foreach ($ExoGroupMember in $ExoGroupMemberList) {
         $ExoGroupMemberTable.Add($ExoGroupMember.ExternalDirectoryObjectId.ToString(), $ExoGroupMember)
     }
 
-    $InconsistentGroupMember = @()
+    $InconsistentGroupMember = New-Object "System.Collections.Generic.List[Object]"
 
     foreach ($AadGroupMember in $AadGroupMemberList) {
 
         # Check if a member object in Azure Active Directory exists in Exchange Online
-        if ($null -ne ($ExoGroupMember = $ExoGroupMemberTable[$AadGroupMember.ObjectId.ToString()])) {
+        $ExoGroupMember = $ExoGroupMemberTable[$AadGroupMember.ObjectId.ToString()]
+        if ($ExoGroupMember) {
 
             # Remove a checked member from the table
-            $ExoGroupMemberTable.Remove($ExoGroupMember.ExternalDirectoryObjectId.ToString())
-
-            # This is a member object that exists in Azure Active Directory but not in Exchange Online
+            $ExoGroupMemberTable.Remove($ExoGroupMember.ExternalDirectoryObjectId.ToString()) | Out-Null
         }
+        # This is a member object that exists in Azure Active Directory but not in Exchange Online
         else {
-            $GroupMemberInfo = New-Object PSObject
-            $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "ObjectId"     -Value $AadGroupMember.ObjectId.ToString()
-            $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "DisplayName"  -Value $AadGroupMember.DisplayName.ToString()
-            $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "EmailAddress" -Value $AadGroupMember.EmailAddress.ToString()
-            $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "Description"  -Value "AAD-Only"
-            $InconsistentGroupMember += $GroupMemberInfo
+            $GroupMemberInfo = [PSCustomObject]@{
+                ObjectId     = $AadGroupMember.ObjectId.ToString()
+                DisplayName  = $AadGroupMember.DisplayName.ToString()
+                EmailAddress = $AadGroupMember.EmailAddress.ToString()
+                Description  = "AAD-Only"
+            }
+            $InconsistentGroupMember.Add($GroupMemberInfo)
         }
     }
 
@@ -192,20 +203,15 @@ function Check-InconsistentGroupMember($AadGroup, $ExoGroup) {
     foreach ($ExoGroupMember in $ExoGroupMemberTable.Values) {
 
         # Get detail information for this member
-        $ExoGroupMemberDetail = Execute-CommandToExo -Command ("Get-Recipient -Identity $($ExoGroupMember.ExternalDirectoryObjectId.ToString()) | Select-Object -Property DisplayName,PrimarySmtpAddress")
+        $ExoGroupMemberDetail = Execute-CommandToExo -Command "Get-Recipient -Identity $($ExoGroupMember.ExternalDirectoryObjectId.ToString()) | Select-Object -Property DisplayName,PrimarySmtpAddress"
 
-        $GroupMemberInfo = New-Object PSObject
-        $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "ObjectId" -Value $ExoGroupMember.ExternalDirectoryObjectId.ToString()
-        if ($null -ne $ExoGroupMemberDetail) {
-            $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "DisplayName"  -Value $ExoGroupMemberDetail.DisplayName.ToString()
-            $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "EmailAddress" -Value $ExoGroupMemberDetail.PrimarySmtpAddress.ToString()
+        $GroupMemberInfo = [PSCustomObject]@{
+            ObjectId     = $ExoGroupMember.ExternalDirectoryObjectId.ToString()
+            DisplayName  = if ($ExoGroupMemberDetail) { $ExoGroupMemberDetail.DisplayName.ToString()        } else { "<Not a mail-enabled recipient>" }
+            EmailAddress = if ($ExoGroupMemberDetail) { $ExoGroupMemberDetail.PrimarySmtpAddress.ToString() } else { $null }
+            Description  = "EXO-Only"
         }
-        else {
-            $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "DisplayName"  -Value "<Not a mail-enabled recipient>"
-            $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "EmailAddress" -Value $null
-        }
-        $GroupMemberInfo | Add-Member -MemberType NoteProperty -Name "Description" -Value "EXO-Only"
-        $InconsistentGroupMember += $GroupMemberInfo
+        $InconsistentGroupMember.Add($GroupMemberInfo)
     }
 
     return $InconsistentGroupMember
@@ -217,18 +223,18 @@ function Check-InconsistentGroup {
     Write-Progress -Activity "Collecting group information from Azure Active Directory and Exchange Online" -Status "Collecting data..."
 
     # Get the list of groups
-    $AadGroupList = @(Get-MsolGroup -All | Where-Object { $_.GroupType -eq "DistributionList" -or $_.GroupType -eq "MailEnabledSecurity" })
-    $ExoGroupList = @(Execute-CommandToExo -Command "Get-DistributionGroup -ResultSize Unlimited | Select-Object -Property ExternalDirectoryObjectId") + @(Execute-CommandToExo -Command "Get-Mailbox -GroupMailbox -ResultSize Unlimited | Select-Object -Property ExternalDirectoryObjectId,RecipientTypeDetails") | Where-Object { $_.ExternalDirectoryObjectId.ToString() -ne "" }
+    $AadGroupList = @(Get-MsolGroup -All | Where-Object { ($_.GroupType -eq "DistributionList") -or ($_.GroupType -eq "MailEnabledSecurity") })
+    $ExoGroupList = @((Execute-CommandToExo -Command "Get-Recipient -Filter ""(RecipientType -eq 'MailUniversalDistributionGroup') -or (RecipientType -eq 'MailUniversalSecurityGroup')"" -ResultSize Unlimited | Select-Object -Property ExternalDirectoryObjectId,RecipientTypeDetails") | Where-Object { $_.ExternalDirectoryObjectId.ToString() -ne "" })
 
     Write-Progress -Activity "Collected group information from Azure Active Directory and Exchange Online" -Status "Collected data" -Completed
 
     # Create a table for comparison
-    $ExoGroupTable = @{ }
+    $ExoGroupTable = New-Object "System.Collections.Generic.Dictionary[String, Object]"($ExoGroupList.Count)
     foreach ($ExoGroup in $ExoGroupList) {
         $ExoGroupTable.Add($ExoGroup.ExternalDirectoryObjectId.ToString(), $ExoGroup)
     }
 
-    $InconsistentGroup = @()
+    $InconsistentGroup = New-Object "System.Collections.Generic.List[Object]"
 
     $ProcessCount = 0
     foreach ($AadGroup in $AadGroupList) {
@@ -236,39 +242,37 @@ function Check-InconsistentGroup {
         Write-Progress -Activity "Checking the sync state for groups in Azure Active Directory and Exchange Online" -Status ("Check the count of group: [$ProcessCount/$($AadGroupList.Count)]") -PercentComplete ($ProcessCount / $AadGroupList.Count * 100)
 
         # Check if a group object in Azure Active Directory exists in Exchange Online
-        if ($null -ne ($ExoGroup = $ExoGroupTable[$AadGroup.ObjectId.ToString()])) {
+        $ExoGroup = $ExoGroupTable[$AadGroup.ObjectId.ToString()]
+        if ($ExoGroup) {
 
-            # Skip checking group members for Office 365 Groups (Not Supported in this script)
-            if (-not ($null -ne $ExoGroup.RecipientTypeDetails -and $ExoGroup.RecipientTypeDetails.ToString() -eq "GroupMailbox")) {
+            # Check if members of a group match in both Azure Active Directory and Exchange Online
+            $MismatchMemberList = @(Check-InconsistentGroupMember -AadGroup $AadGroup -ExoGroup $ExoGroup)
 
-                # Check if members of a group match in both Azure Active Directory and Exchange Online
-                $MismatchMemberList = @(Check-InconsistentGroupMember -AadGroup $AadGroup -ExoGroup $ExoGroup)
-
-                # This is a group that has mismatched members
-                if ($MismatchMemberList.Count -gt 0) {
-                    $GroupInfo = New-Object PSObject
-                    $GroupInfo | Add-Member -MemberType NoteProperty -Name "ObjectId"      -Value $AadGroup.ObjectId.ToString()
-                    $GroupInfo | Add-Member -MemberType NoteProperty -Name "DisplayName"   -Value $AadGroup.DisplayName.ToString()
-                    $GroupInfo | Add-Member -MemberType NoteProperty -Name "EmailAddress"  -Value $AadGroup.EmailAddress.ToString()
-                    $GroupInfo | Add-Member -MemberType NoteProperty -Name "Description"   -Value "Mismatch-Member"
-                    $GroupInfo | Add-Member -MemberType NoteProperty -Name "MemberDetails" -Value (Format-DisplayString -MemberList $MismatchMemberList)
-                    $InconsistentGroup += $GroupInfo
+            # This is a group that has mismatched members
+            if ($MismatchMemberList.Count -gt 0) {
+                $GroupInfo = [PSCustomObject]@{
+                    ObjectId      = $AadGroup.ObjectId.ToString()
+                    DisplayName   = $AadGroup.DisplayName.ToString()
+                    EmailAddress  = $AadGroup.EmailAddress.ToString()
+                    Description   = "Mismatch-Member"
+                    MemberDetails = Format-DisplayString -MemberList $MismatchMemberList
                 }
+                $InconsistentGroup.Add($GroupInfo)
             }
 
             # Remove a checked group from the table
-            $ExoGroupTable.Remove($ExoGroup.ExternalDirectoryObjectId.ToString())
-
-            # This is a group object that exists in Azure Active Directory but not in Exchange Online
+            $ExoGroupTable.Remove($ExoGroup.ExternalDirectoryObjectId.ToString()) | Out-Null
         }
+        # This is a group object that exists in Azure Active Directory but not in Exchange Online
         else {
-            $GroupInfo = New-Object PSObject
-            $GroupInfo | Add-Member -MemberType NoteProperty -Name "ObjectId"      -Value $AadGroup.ObjectId.ToString()
-            $GroupInfo | Add-Member -MemberType NoteProperty -Name "DisplayName"   -Value $AadGroup.DisplayName.ToString()
-            $GroupInfo | Add-Member -MemberType NoteProperty -Name "EmailAddress"  -Value $AadGroup.EmailAddress.ToString()
-            $GroupInfo | Add-Member -MemberType NoteProperty -Name "Description"   -Value "AAD-Only"
-            $GroupInfo | Add-Member -MemberType NoteProperty -Name "MemberDetails" -Value $null
-            $InconsistentGroup += $GroupInfo
+            $GroupInfo = [PSCustomObject]@{
+                ObjectId      = $AadGroup.ObjectId.ToString()
+                DisplayName   = $AadGroup.DisplayName.ToString()
+                EmailAddress  = $AadGroup.EmailAddress.ToString()
+                Description   = "AAD-Only"
+                MemberDetails = $null
+            }
+            $InconsistentGroup.Add($GroupInfo)
         }
 
         $ProcessCount++
@@ -278,15 +282,16 @@ function Check-InconsistentGroup {
     foreach ($ExoGroup in $ExoGroupTable.Values) {
 
         # Get detail information for this group
-        $ExoGroupDetail = Execute-CommandToExo -Command ("Get-DistributionGroup -Identity $($ExoGroup.ExternalDirectoryObjectId.ToString()) | Select-Object -Property DisplayName,PrimarySmtpAddress")
+        $ExoGroupDetail = Execute-CommandToExo -Command "Get-Recipient -Identity $($ExoGroup.ExternalDirectoryObjectId.ToString()) | Select-Object -Property DisplayName,PrimarySmtpAddress"
 
-        $GroupInfo = New-Object PSObject
-        $GroupInfo | Add-Member -MemberType NoteProperty -Name "ObjectId"      -Value $ExoGroup.ExternalDirectoryObjectId.ToString()
-        $GroupInfo | Add-Member -MemberType NoteProperty -Name "DisplayName"   -Value $ExoGroupDetail.DisplayName.ToString()
-        $GroupInfo | Add-Member -MemberType NoteProperty -Name "EmailAddress"  -Value $ExoGroupDetail.PrimarySmtpAddress.ToString()
-        $GroupInfo | Add-Member -MemberType NoteProperty -Name "Description"   -Value "EXO-Only"
-        $GroupInfo | Add-Member -MemberType NoteProperty -Name "MemberDetails" -Value $null
-        $InconsistentGroup += $GroupInfo
+        $GroupInfo = [PSCustomObject]@{
+            ObjectId      = $ExoGroup.ExternalDirectoryObjectId.ToString()
+            DisplayName   = $ExoGroupDetail.DisplayName.ToString()
+            EmailAddress  = $ExoGroupDetail.PrimarySmtpAddress.ToString()
+            Description   = "EXO-Only"
+            MemberDetails = $null
+        }
+        $InconsistentGroup.Add($GroupInfo)
     }
 
     Write-Progress -Activity "Checked the sync state for groups in Azure Active Directory and Exchange Online" -Status ("Check the count of group: [$ProcessCount/$($AadGroupList.Count)]") -Completed
